@@ -27,6 +27,9 @@ import pandas as pd  # Add pandas import
 import matplotlib.pyplot as plt
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import sys
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+from tool.field_losses import FieldLoss, batches, coordinate_weights, training_loss
 
 # set all random seeds
 random.seed(42)
@@ -37,8 +40,8 @@ torch.cuda.manual_seed_all(42)
 torch.backends.cudnn.deterministic = True
 
 
-print(os.environ["CUDA_HOME"])
-print(os.environ["LD_LIBRARY_PATH"])
+print(os.environ.get("CUDA_HOME", ""))
+print(os.environ.get("LD_LIBRARY_PATH", ""))
 print(torch.cuda.is_available())
 # assert torch.cuda.is_available()  # not available in debug mode, dunno why
 
@@ -115,7 +118,7 @@ def load_config(args, actions):
     # Convert values to proper types based on argument parser types
     # for action in parser._actions:
     for action in actions:
-        if action.dest in config and action.type is not None:
+        if action.dest in config and action.type is not None and not isinstance(config[action.dest], list):
             config[action.dest] = action.type(config[action.dest])
 
     # if override_args:
@@ -489,6 +492,13 @@ def load_from_checkpoint(checkpoint_path, device):
 
 
 def main():
+    global device
+    rank = int(os.environ.get("LOCAL_RANK", 0))
+    distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    if distributed:
+        torch.cuda.set_device(rank)
+        device = torch.device("cuda", rank)
+        dist.init_process_group("nccl")
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train form filler model")
     parser.add_argument(
@@ -569,6 +579,8 @@ def main():
         type=int,
         help="Maximum number of examples to use per image (overrides config)",
     )
+    parser.add_argument("--balanced_ce", action="store_true", default=None)
+    parser.add_argument("--spatial_loss_weight", type=float)
     args = parser.parse_args()
     config = load_config(args, parser._actions)
 
@@ -610,7 +622,11 @@ def main():
     if NOTE:
         run_name = f"{run_name}_{NOTE.replace(' ', '_')}"
 
-    run = wandb.init(project="form-filler", name=run_name, config=config)
+    run = wandb.init(project="form-filler", name=run_name, config=config,
+                     mode="disabled" if rank else None)
+    if distributed or config.get("balanced_ce") or config.get("spatial_loss_weight", 0):
+        assert not LOAD_CHECKPOINT_FROM and not config.get("use_peft", False), "Use fresh full-model training"
+        assert EPOCHS_PER_EVAL == EPOCHS, "Use final-only evaluation"
 
     disable_caching()
 
@@ -704,7 +720,11 @@ def main():
     )
 
     # Initialize optimizer and scheduler
-    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
+    objective = FieldLoss(model, config.get("spatial_loss_weight", 0.0))
+    coordinate_ids = processor.tokenizer.convert_tokens_to_ids([f"<loc_{i}>" for i in range(1000)])
+    assert coordinate_ids == list(range(coordinate_ids[0], coordinate_ids[0] + 1000))
+    torch.set_float32_matmul_precision("high")
+    optimizer = AdamW(objective.parameters(), lr=LEARNING_RATE, fused=device.type == "cuda")
     num_training_steps = EPOCHS * len(train_loader)
     lr_scheduler = get_scheduler(
         name="cosine",
@@ -753,6 +773,8 @@ def main():
             f"Percentage of trainable parameters: {100 * trainable_params / total_params:.2f}%"
         )
 
+    loss_model = DistributedDataParallel(objective, device_ids=[rank], find_unused_parameters=True) if distributed else objective
+    torch.cuda.manual_seed(42 + rank)
     batch_no = -1
     val_accuracy, val_loss, predictions_df = None, None, None
     total_batches = 0
@@ -761,7 +783,8 @@ def main():
         model.train()
         train_loss = 0
         for inputs, answers, widths, heights, bboxes, image_paths in tqdm(
-            train_loader, desc=f"Training Epoch {epoch + 1}/{EPOCHS}"
+            batches(train_loader), total=len(train_loader), disable=rank != 0,
+            desc=f"Training Epoch {epoch + 1}/{EPOCHS}"
         ):
             batch_no += 1
             total_batches += 1
@@ -774,10 +797,10 @@ def main():
                 padding_side="left",
                 return_token_type_ids=False,
             ).input_ids.to(device)
-            outputs = model(
-                input_ids=input_ids, pixel_values=pixel_values, labels=labels
-            )
-            loss = outputs.loss
+            weights = coordinate_weights(labels, coordinate_ids[0], coordinate_ids[-1]) if config.get("balanced_ce") else None
+            boxes = torch.tensor([[b['x1']/w, b['y1']/h, b['x2']/w, b['y2']/h]
+                                  for b, w, h in zip(bboxes, widths, heights)], device=device)
+            loss = training_loss(loss_model, inputs, labels, weights, boxes)
             loss.backward()
             optimizer.step()
             lr_scheduler.step()
@@ -799,11 +822,22 @@ def main():
                 batch_no % int(EPOCHS_PER_EVAL * batches_per_epoch) == 0
                 and batch_no != 0
             ) or batch_no == EPOCHS * batches_per_epoch - 1:
+                if distributed:
+                    dist.barrier()
+                    del loss_model
+                    dist.destroy_process_group()
+                    if rank:
+                        return
+                torch.set_float32_matmul_precision("highest")
                 val_loss = calculate_loss(model, val_loader, processor)
                 per_dataset_metrics, all_predictions_data = evaluate_per_dataset(
                     model, val_datasets, config, processor, MAX_IOU_EXAMPLES
                 )
                 predictions_df = pd.DataFrame(all_predictions_data)
+                os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+                predictions_df.drop(columns=["pixel_values"]).to_json(os.path.join(CHECKPOINT_DIR, "validation_predictions.jsonl"), orient="records", lines=True)
+                with open(os.path.join(CHECKPOINT_DIR, "validation_metrics.json"), "w") as report:
+                    json.dump(per_dataset_metrics, report, indent=2)
 
                 # Calculate overall metrics for logging
                 overall_iou = sum(
@@ -841,6 +875,9 @@ def main():
 
                 # Save optimizer and scheduler states
                 model.save_pretrained(checkpoint_path)
+                processor.save_pretrained(checkpoint_path)
+                if objective.head is not None:
+                    torch.save(objective.head.state_dict(), os.path.join(checkpoint_path, "spatial_head.pt"))
                 torch.save(
                     {
                         "optimizer_state_dict": optimizer.state_dict(),
@@ -857,6 +894,8 @@ def main():
                 manage_checkpoints(
                     os.path.join(CHECKPOINT_DIR, timestamp), max_checkpoints=4
                 )
+                model.train()
+                torch.set_float32_matmul_precision("high")
 
         avg_train_loss = train_loss / len(train_loader)
         print(f"Average Training Loss: {avg_train_loss}")
